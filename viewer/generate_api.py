@@ -2644,7 +2644,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not image_api.BINARY.exists():
             self._send_json(503, {
-                "error": "stable-diffusion.cpp is not installed (vendor/sdcpp/sd-cli).",
+                "error": "stable-diffusion.cpp is not installed "
+                         "(vendor/sdcpp/sd-cli or vendor/sdcpp-cuda/build/bin/sd-cli).",
                 "needs_setup": True,
             })
             return

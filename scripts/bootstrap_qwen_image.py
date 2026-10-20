@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Install the text-to-image route: a stable-diffusion.cpp binary and Qwen-Image weights.
 
-Two halves, the same way the viewer tracks every other backend. The **build** is a
-prebuilt `stable-diffusion.cpp` release binary. Nothing is compiled: upstream publishes a
-Metal build for Apple Silicon, a CUDA build for Windows, a Vulkan build for Linux that
-runs on NVIDIA cards, and a ROCm build for AMD cards on Linux. The **weights** are three
-files totalling about 13.4 GB.
+Two halves, the same way the viewer tracks every other backend. The **build** is normally
+a prebuilt `stable-diffusion.cpp` release binary. Linux/NVIDIA can instead compile a CUDA
+build from upstream source with `--cuda`; its Linux prebuilt uses Vulkan. The **weights**
+are three files totalling about 13.4 GB.
 
 `AGENTS.md`: a download path must name the backend, name the route, state the size, and
 require an affirmative answer. This prints all of that and stops, unless `--yes` is given
@@ -14,6 +13,7 @@ for non-interactive use. Defaulting to yes is not allowed, so it does not.
     python scripts/bootstrap_qwen_image.py            # says what it wants, then asks
     python scripts/bootstrap_qwen_image.py --yes      # for the viewer and for scripts
     python scripts/bootstrap_qwen_image.py --build-only
+    python scripts/bootstrap_qwen_image.py --cuda      # CUDA build for Linux/NVIDIA only
 """
 
 from __future__ import annotations
@@ -39,6 +39,11 @@ from image_to_3dlab.sdcpp import NO_AMD_GPU_HELP, NO_GPU_HELP, gpu_found
 
 VENDOR = REPO / "vendor" / "sdcpp"
 BINARY = host.executable(VENDOR, "sd-cli")
+CUDA_SOURCE = REPO / "vendor" / "sdcpp-cuda"
+CUDA_BUILD = CUDA_SOURCE / "build"
+CUDA_BINARY = host.executable(CUDA_BUILD / "bin", "sd-cli")
+UPSTREAM = "https://github.com/leejet/stable-diffusion.cpp.git"
+CUDA_SOURCE_REF = "master-975-95b3090"
 RELEASES = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest"
 
 # (repo, filename, approximate gigabytes). These are the files the upstream Qwen-Image 2.1
@@ -65,17 +70,23 @@ def total_gb() -> float:
     return sum(size for _, _, size in WEIGHTS)
 
 
-def announcement(build: bool = True, weights: bool = True) -> str:
+def announcement(build: bool = True, weights: bool = True, cuda: bool = False) -> str:
     """Exactly what is about to be fetched, before anything is.
 
     A separate function so a test can assert the backend, the route, the size and the
     licence are all named without running a download.
     """
     build_for = BUILDS.get(target())
-    route = build_for.route if build_for else "no prebuilt build for this machine"
+    route = (f"CUDA from stable-diffusion.cpp source @ {CUDA_SOURCE_REF}"
+             if cuda else build_for.route if build_for else
+             "no prebuilt build for this machine")
     lines = ["", "About to install:", "", "  backend: Qwen-Image 2.1 (text to image)",
              f"  route:   GGUF via stable-diffusion.cpp, {route}"]
-    if build and build_for:
+    if build and cuda:
+        lines.append("  build:   ~130 MB source, ~10-20 minutes compiling, several GB temporary "
+                     "space; needs nvcc, CMake, Git and a C++ compiler -> "
+                     "vendor/sdcpp-cuda/")
+    elif build and build_for:
         lines.append(f"  build:   prebuilt sd-cli release ({build_for.size}) -> vendor/sdcpp/")
     if weights:
         lines.append(f"  weights: {total_gb():.1f} GB total ->  Hugging Face cache")
@@ -199,6 +210,57 @@ def install_binary(destination: Path = VENDOR) -> Path:
     return finish_install(destination)
 
 
+def cuda_build_flags(nvcc: str, architecture: str | None) -> list[str]:
+    """CMake settings for an sd.cpp CUDA build, targeted at this NVIDIA card."""
+    return ["-DCMAKE_BUILD_TYPE=Release", "-DSD_CUDA=ON",
+            f"-DCMAKE_CUDA_COMPILER={nvcc}",
+            f"-DCMAKE_CUDA_ARCHITECTURES={architecture or 'native'}"]
+
+
+def install_cuda_binary() -> Path:
+    """Build upstream stable-diffusion.cpp with CUDA in its own ignored vendor tree."""
+    if target() != "linux-nvidia":
+        raise SystemExit("The CUDA source build is for Linux/WSL with an NVIDIA GPU.")
+    nvcc = host.find_nvcc()
+    if not nvcc:
+        raise SystemExit(
+            "CUDA toolkit compiler (nvcc) not found in WSL. Install the CUDA toolkit "
+            "for WSL, then confirm `nvcc --version` works. Do not install a Linux GPU "
+            "driver inside WSL. Nothing was built.")
+    for tool in ("git", "cmake"):
+        if shutil.which(tool) is None:
+            raise SystemExit(f"{tool} not found in WSL. Install it, then retry.")
+    if not any(shutil.which(tool) for tool in ("c++", "g++", "clang++")):
+        raise SystemExit("A C++ compiler was not found in WSL. Install build-essential, "
+                         "then retry.")
+
+    CUDA_SOURCE.mkdir(parents=True, exist_ok=True)
+    if not (CUDA_SOURCE / ".git").is_dir():
+        subprocess.run(["git", "init", "-q", str(CUDA_SOURCE)], check=True)
+        subprocess.run(["git", "-C", str(CUDA_SOURCE), "remote", "add", "origin", UPSTREAM],
+                       check=True)
+    subprocess.run(["git", "-C", str(CUDA_SOURCE), "fetch", "--depth", "1", "origin",
+                    CUDA_SOURCE_REF], check=True)
+    subprocess.run(["git", "-C", str(CUDA_SOURCE), "checkout", "-q", "FETCH_HEAD"],
+                   check=True)
+    subprocess.run(["git", "-C", str(CUDA_SOURCE), "submodule", "update", "--init",
+                    "--recursive", "--depth", "1"], check=True)
+
+    configure = ["cmake", "-S", str(CUDA_SOURCE), "-B", str(CUDA_BUILD),
+                 *cuda_build_flags(nvcc, host.compute_capability())]
+    print("Configuring stable-diffusion.cpp for CUDA...", flush=True)
+    subprocess.run(configure, check=True)
+    jobs = min(host.build_jobs(), 4)
+    print(f"Building sd-cli for CUDA ({jobs} compile jobs)...", flush=True)
+    subprocess.run(["cmake", "--build", str(CUDA_BUILD), "--target", "sd-cli", "-j",
+                    str(jobs)], check=True)
+    if not CUDA_BINARY.exists():
+        raise SystemExit(f"CUDA build completed without sd-cli at {CUDA_BINARY}.")
+    CUDA_BINARY.chmod(CUDA_BINARY.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    print(f"Installed CUDA build at {CUDA_BINARY}", flush=True)
+    return CUDA_BINARY
+
+
 def restore_symlinks(bundle: zipfile.ZipFile, destination: Path) -> None:
     """Turn extracted symlink entries back into real links.
 
@@ -299,14 +361,24 @@ def main(argv: list[str] | None = None) -> int:
                         help="Install the binary and stop, leaving the weights.")
     parser.add_argument("--weights-only", action="store_true",
                         help="Fetch the weights only, assuming sd-cli is already present.")
+    parser.add_argument("--cuda", action="store_true",
+                        help="Build stable-diffusion.cpp for CUDA from source on Linux/NVIDIA; "
+                             "does not fetch model weights.")
     parser.add_argument("--vision", action="store_true",
                         help=f"Fetch only the {VISION[2]:.2f} GB vision projector edit mode "
                              "needs (back pictures for front + back builds).")
     args = parser.parse_args(argv)
 
-    build = not args.weights_only and not args.vision
-    weights = not args.build_only and not args.vision
-    print(vision_announcement() if args.vision else announcement(build=build, weights=weights))
+    if args.cuda and (args.weights_only or args.vision):
+        parser.error("--cuda is a build-only action and cannot be combined with "
+                     "--weights-only or --vision")
+    if args.cuda and target() != "linux-nvidia":
+        parser.error("--cuda requires Linux/WSL with an NVIDIA GPU")
+
+    build = args.cuda or (not args.weights_only and not args.vision)
+    weights = not args.build_only and not args.vision and not args.cuda
+    print(vision_announcement() if args.vision else
+          announcement(build=build, weights=weights, cuda=args.cuda))
 
     if not args.yes:
         # Non-interactive without --yes must not silently proceed, and must not hang
@@ -319,6 +391,19 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if build:
+        if args.cuda:
+            if CUDA_BINARY.exists():
+                print(f"\nCUDA sd-cli is already installed at {CUDA_BINARY}, leaving it alone.")
+            else:
+                install_cuda_binary()
+            output = probe_gpu(CUDA_BINARY)
+            if "CUDA backend" not in output and "ggml_cuda_init: found" not in output:
+                print("\nThe CUDA build did not expose a working CUDA backend. "
+                      "The existing Vulkan build was left untouched.")
+                return 1
+            print("sd-cli found the CUDA GPU.")
+            print("\nDone. Restart the studio to use the CUDA build.")
+            return 0
         if binary_present():
             print(f"\nsd-cli is already installed at {BINARY}, leaving it alone.")
         else:

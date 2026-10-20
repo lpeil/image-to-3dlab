@@ -1,8 +1,9 @@
 """Text to image, one step upstream of everything else in this repo.
 
 Every other tool here starts from a picture. This one makes the picture, for people who
-do not have one yet. It drives `stable-diffusion.cpp` (a prebuilt Metal binary in
-`vendor/sdcpp/`) against Qwen-Image 2.1 in GGUF form.
+do not have one yet. It drives `stable-diffusion.cpp` against Qwen-Image 2.1 in GGUF form:
+Metal on Apple Silicon, Vulkan by default on Linux/NVIDIA, or the optional CUDA source
+build in `vendor/sdcpp-cuda/`.
 
 Two things are deliberate:
 
@@ -41,12 +42,24 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from image_to_3dlab import back_view, matte
-from image_to_3dlab.host import APPLE, executable, host_platform, with_rocm_libraries
+from image_to_3dlab.host import AMD, APPLE, NVIDIA, executable, host_platform, with_rocm_libraries
 from image_to_3dlab.provenance import LICENSES, QWEN_OUTPUT_RIGHTS
 from image_to_3dlab.sdcpp import BackendWatch, no_gpu_help
 
 HF_HUB = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
-BINARY = executable(REPO / "vendor" / "sdcpp", "sd-cli")
+VULKAN_BINARY = executable(REPO / "vendor" / "sdcpp", "sd-cli")
+CUDA_BINARY = executable(REPO / "vendor" / "sdcpp-cuda" / "build" / "bin", "sd-cli")
+# Keep the prebuilt fallback intact. Once the separately built CUDA binary exists on
+# Linux/NVIDIA, both normal image jobs and backpicture edits use it after a server restart.
+
+
+def select_binary(platform: str, cuda_binary: Path = CUDA_BINARY,
+                  vulkan_binary: Path = VULKAN_BINARY) -> Path:
+    """Prefer the optional CUDA build on NVIDIA; otherwise retain the normal build."""
+    return cuda_binary if platform == NVIDIA and cuda_binary.exists() else vulkan_binary
+
+
+BINARY = select_binary(host_platform())
 # Every picture lands in output/images/. Its licence (Qwen's research licence, today) is
 # recorded in the provenance written beside it, which is what travels with the file; a
 # folder name did not, and sorting by it only made the pictures harder to find.
@@ -191,6 +204,8 @@ def build_command(prompt: str, settings: dict[str, Any], output_path: Path,
     """
     command = [
         str(binary),
+        "--backend", ("diffusion=cuda0,te=cpu,vae=cpu"
+                      if Path(binary) == CUDA_BINARY else "te=cpu,vae=cpu"),
         "--diffusion-model", str(weights["diffusion_model"]),
         "--vae", str(weights["vae"]),
         "--llm", str(weights["llm"]),
@@ -244,18 +259,40 @@ def parse_progress(line: str) -> dict[str, Any] | None:
 
 
 def failure_reason(log_lines) -> str | None:
-    """sd-cli's last meaningful words, or None if it said nothing but progress.
+    """The most specific failure in sd-cli's log, or None if it said only progress.
 
-    A failed run used to surface as "sd-cli exited with code 2" while the actual
-    explanation -- a rejected flag, a missing file -- sat unread in the log tail, and
-    the image tab has no log panel to find it in. So the one line that matters goes
-    into the error itself; it is shown as plain text, hence one line only.
+    Prefer the underlying error over generic wrapper failures and teardown messages,
+    which otherwise hide the Vulkan or allocation error that caused the run to stop.
     """
-    for line in reversed(list(log_lines)):
+    lines = list(log_lines)
+    # The binary prints a short chain of generic failures after the operation that
+    # actually broke. Prefer the underlying [E] line, and ignore teardown chatter:
+    # otherwise a lost Vulkan device is reported as "model manager released...".
+    wrappers = (
+        "diffusion model compute failed",
+        "diffusion model sampling failed",
+        "sampling for image ",
+        "vae decode compute failed",
+        "decode_first_stage failed",
+        "generate failed",
+    )
+    cleanup = (
+        "model manager released params backend buffers",
+        "d3d12: removing device",
+    )
+    errors = []
+    for line in reversed(lines):
         text = line.strip()
         if not text or PROGRESS.search(text):
             continue
-        return text
+        lowered = text.lower()
+        if any(marker in lowered for marker in cleanup):
+            continue
+        if "[e]" in lowered and not any(marker in lowered for marker in wrappers):
+            return text
+        errors.append(text)
+    if errors:
+        return errors[0]
     return None
 
 
@@ -288,7 +325,7 @@ def provenance(prompt: str, settings: dict[str, Any], seconds: float,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": {
             "id": MODEL_ID,
-            "runtime": "stable-diffusion.cpp (Metal)",
+            "runtime": runtime_name(),
             "weights": weight_manifest(),
         },
         "license": {
@@ -304,6 +341,22 @@ def provenance(prompt: str, settings: dict[str, Any], seconds: float,
         "elapsed_seconds": round(seconds, 1),
         "output": output_path.name,
     }
+
+
+def runtime_name() -> str:
+    """The sd.cpp accelerator selected for this installation, for the provenance sidecar."""
+    if BINARY == CUDA_BINARY:
+        return "stable-diffusion.cpp (CUDA)"
+    platform = host_platform()
+    if platform == APPLE:
+        accelerator = "Metal"
+    elif platform == AMD:
+        accelerator = "ROCm"
+    elif platform == NVIDIA:
+        accelerator = "Vulkan"
+    else:
+        accelerator = "CPU"
+    return f"stable-diffusion.cpp ({accelerator})"
 
 
 @dataclass

@@ -61,6 +61,35 @@ def test_build_only_does_not_promise_weights(monkeypatch):
     assert "build:" in text
 
 
+def test_cuda_announcement_names_build_and_excludes_weights(monkeypatch):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    text = boot.announcement(build=True, weights=False, cuda=True)
+    assert "CUDA from stable-diffusion.cpp source" in text
+    assert "several GB temporary space" in text
+    assert "weights:" not in text
+
+
+def test_cuda_build_flags_target_the_local_card():
+    flags = boot.cuda_build_flags("/usr/local/cuda/bin/nvcc", "89")
+    assert "-DSD_CUDA=ON" in flags
+    assert "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc" in flags
+    assert "-DCMAKE_CUDA_ARCHITECTURES=89" in flags
+
+
+def test_cuda_action_builds_only_and_leaves_model_weights_alone(monkeypatch, tmp_path,
+                                                                capsys):
+    monkeypatch.setattr(boot, "target", lambda: "linux-nvidia")
+    monkeypatch.setattr(boot, "CUDA_BINARY", tmp_path / "sd-cli")
+    monkeypatch.setattr(boot, "install_cuda_binary", lambda: None)
+    monkeypatch.setattr(boot, "probe_gpu", lambda *_: "load_backend: loaded CUDA backend")
+    monkeypatch.setattr(boot, "install_weights", lambda: pytest.fail("weights fetched"))
+    assert boot.main(["--cuda", "--yes"]) == 0
+    output = capsys.readouterr().out
+    assert "CUDA from stable-diffusion.cpp source" in output
+    assert "weights:" not in output
+    assert "Restart the studio" in output
+
+
 def test_nothing_downloads_without_a_yes(monkeypatch, capsys):
     """Declining must stop, and must not call either installer."""
     monkeypatch.setattr(boot, "install_binary", lambda *a, **k: pytest.fail("downloaded"))

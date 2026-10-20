@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Qwen-Image can use an optional `stable-diffusion.cpp` CUDA build on Linux/NVIDIA. The
+  installer builds it separately from the existing Vulkan binary and does not fetch model
+  weights; after setup, the viewer uses CUDA for diffusion and CPU for text and VAE.
+
 ## [0.4.6] - 2026-10-18
 
 ### Added

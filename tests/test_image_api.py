@@ -67,6 +67,25 @@ def test_command_carries_all_three_weights():
         assert command[command.index(flag) + 1] == str(WEIGHTS[key])
 
 
+def test_command_runs_text_encoder_and_vae_on_cpu():
+    command = command_for()
+    assert command[command.index("--backend") + 1] == "te=cpu,vae=cpu"
+
+
+def test_cuda_binary_is_preferred_only_on_nvidia(tmp_path):
+    cuda = tmp_path / "cuda-sd-cli"
+    vulkan = tmp_path / "vulkan-sd-cli"
+    cuda.touch()
+    assert api.select_binary(HOST_NVIDIA, cuda, vulkan) == cuda
+    assert api.select_binary(HOST_APPLE, cuda, vulkan) == vulkan
+
+
+def test_cuda_build_runs_diffusion_on_cuda_and_keeps_text_and_vae_on_cpu():
+    command = api.build_command("a fox", api.clean_settings({}), Path("/out/x.png"),
+                                WEIGHTS, binary=api.CUDA_BINARY)
+    assert command[command.index("--backend") + 1] == "diffusion=cuda0,te=cpu,vae=cpu"
+
+
 def test_prompt_is_one_argument_not_shell_text():
     """The command is a list handed to Popen without a shell, so a prompt containing
     quotes, semicolons or flags stays a prompt."""
@@ -145,6 +164,12 @@ def test_provenance_records_the_licence_and_its_class():
     assert "Built with Qwen" == record["license"]["attribution"]
     assert record["prompt"] == "a fox"
     json.dumps(record)  # must survive being written to the sidecar
+
+
+def test_provenance_names_cuda_when_its_build_is_active(monkeypatch):
+    monkeypatch.setattr(api, "BINARY", api.CUDA_BINARY)
+    record = api.provenance("a fox", api.clean_settings({}), 1.0, Path("/o/fox.png"))
+    assert record["model"]["runtime"] == "stable-diffusion.cpp (CUDA)"
 
 
 def test_provenance_says_the_output_is_yours_and_cites_qwen():
@@ -255,6 +280,17 @@ def test_a_failed_run_says_why_not_just_the_exit_code(tmp_path, monkeypatch):
     assert job.status == "error"
     assert "code 2" in job.error
     assert "flag provided but not defined: -diffusion-model" in job.error
+
+
+def test_a_failed_gpu_run_reports_the_specific_error_before_cleanup():
+    lines = [
+        "[E] ggml_vulkan: device lost on Vulkan0",
+        "[E] diffusion model compute failed --- diffusion_engine.cpp:2744",
+        "[E] generate failed --- main.cpp:940",
+        "[V] model manager released params backend buffers (6856 MB) from Vulkan_Host",
+        "D3D12: Removing Device.",
+    ]
+    assert api.failure_reason(lines) == "[E] ggml_vulkan: device lost on Vulkan0"
 
 
 def test_a_failed_run_with_only_progress_says_just_the_code(tmp_path, monkeypatch):

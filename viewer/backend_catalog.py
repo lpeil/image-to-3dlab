@@ -755,7 +755,8 @@ CATALOG: tuple[Backend, ...] = (
         tradeoff="Runs on your machine, and the pictures you make are yours.",
         license_name="Qwen Research License",
         license_url="https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE",
-        install="Prebuilt stable-diffusion.cpp binary in vendor/sdcpp/",
+        install=("stable-diffusion.cpp: prebuilt in vendor/sdcpp/; on Linux/NVIDIA, "
+                 "optional CUDA source build with scripts/bootstrap_qwen_image.py --cuda"),
         runs_on=(APPLE, NVIDIA, AMD),
         setup_minutes=15,
         build_probes=(_host.executable(REPO / "vendor" / "sdcpp", "sd-cli"),),
